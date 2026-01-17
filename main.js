@@ -1,69 +1,26 @@
-require("dotenv").config();
-const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
-const qrcode = require("qrcode-terminal");
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
 
-const axios = require("axios");
-const ffmpeg = require("fluent-ffmpeg");
-const youtube = require("youtube-sr").default;
-const ytdl = require("@distube/ytdl-core");
+// Compatibilidade com ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-const fs = require("fs");
-const path = require("path");
+import { client, MessageMedia, qrcode } from "./src/whatsapp.js";
+import { recogniseSong } from "./src/shazam.js";
+import { convertToPCM, convertToMp3 } from "./src/audio.js";
+import { searchFromYoutube, downloadAudioFromYoutube } from "./src/youtube.js";
+import { ensureDir, createPath, clearTempFiles, logWithTimestamp } from "./src/utils.js";
 
-const client = new Client({
-    authStrategy: new LocalAuth({
-        dataPath: "./session",
-    }),
-});
+// Estado dos usuários
+const userStates = {};
 
-const userStates = {}
-
-// Função para converter OGG para WAV PCM mono 16kHz
-function convertToPCM(inputPath, outputPath) {
-    return new Promise((resolve, reject) => {
-        ffmpeg(inputPath)
-            .noVideo()
-            .audioCodec("pcm_s16le")
-            .audioChannels(1)
-            .audioFrequency(44100) // precisa ser 44100 Hz
-            .format("s16le")       // raw PCM
-            .outputOptions(["-t 5"]) // só 5 segundos
-            .on("end", () => resolve(outputPath))
-            .on("error", reject)
-            .save(outputPath);
-    });
-}
-
+// Função para obter nome do usuário
 function getUserName(chat) {
     return chat.name || chat.pushname || "usuário";
 }
 
-// Função para enviar ao Shazam API (RapidAPI)
-async function recogniseSong(base64Audio) {
-    const options = {
-        method: "POST",
-        url: "https://shazam.p.rapidapi.com/songs/v2/detect",
-        params: {
-            timezone: "Africa/Luanda",
-            locale: "pt-AO",
-        },
-        headers: {
-            "x-rapidapi-key": process.env.RAPIDAPI_KEY,
-            "x-rapidapi-host": "shazam.p.rapidapi.com",
-            "Content-Type": "text/plain",
-        },
-        data: base64Audio,
-    };
-
-    const response = await axios.request(options);
-    return response.data;
-}
-
-function logWithTimestamp(message) {
-    const now = new Date().toISOString();
-    console.log(`[${now}] ${message}`);
-}
-
+// Eventos do cliente WhatsApp
 client.on("qr", (qr) => {
     logWithTimestamp("QR code gerado para autenticação.");
     qrcode.generate(qr, { small: true });
@@ -73,18 +30,12 @@ client.on("ready", () => {
     logWithTimestamp("✅ WhatsApp Bot pronto!");
 });
 
-// Cria diretório se não existir
-function ensureDir(dirPath) {
-    if (!fs.existsSync(dirPath)) {
-        fs.mkdirSync(dirPath);
-        logWithTimestamp(`Diretório criado: ${dirPath}`);
-    }
-}
-
 // Pesquisa no YouTube e salva resultados no estado
 async function handleYoutubeSearch(client, chatId, state, query) {
     await client.sendMessage(chatId, "Pesquisando...");
-    const results = await youtube.search(query, { type: "video", limit: 10 });
+
+    const results = await searchFromYoutube(query);
+
     if (results.length === 0) {
         await client.sendMessage(chatId, "Nenhum resultado encontrado.");
         state.step = "init";
@@ -99,58 +50,36 @@ async function handleYoutubeSearch(client, chatId, state, query) {
     }
 }
 
-// Baixa, converte e envia música do YouTube
+// Faz download e envia áudio do YouTube
 async function handleYoutubeDownloadAndSend(client, chatId, state, choice) {
     const video = state.youtubeResults[choice - 1];
-    await client.sendMessage(chatId, `Baixando "${video.title}" (Pode demorar um pouquinho 😁)...`);
+    
+    await client.sendMessage(chatId, `Baixando "${video.title}"...`);
+    logWithTimestamp(`Iniciando download: ${video.title}`);
 
-    const downloadsDir = path.join(__dirname, "Downloads");
-    ensureDir(downloadsDir);
-
-    const timestamp = Date.now();
-    const mp3Path = path.join(downloadsDir, `music-${timestamp}.mp3`);
-    const tempAudioPath = path.join(downloadsDir, `music-${timestamp}.webm`);
+    const { mp3Path, tempAudioPath } = createPath();
 
     try {
-        // Baixa o áudio do YouTube
-        const audioStream = ytdl(video.url, { filter: "audioonly", quality: "highestaudio" });
-        const writeStream = fs.createWriteStream(tempAudioPath);
-        await new Promise((resolve, reject) => {
-            audioStream.pipe(writeStream);
-            audioStream.on("end", resolve);
-            audioStream.on("error", reject);
-        });
+        await downloadAudioFromYoutube(video, tempAudioPath);
+        logWithTimestamp(`Download concluído: ${tempAudioPath}`);
 
-        // Converte para MP3
-        await new Promise((resolve, reject) => {
-            ffmpeg(tempAudioPath)
-                .audioCodec("libmp3lame")
-                .audioBitrate(192)
-                .format("mp3")
-                .on("end", resolve)
-                .on("error", reject)
-                .save(mp3Path);
-        });
+        await convertToMp3(tempAudioPath, mp3Path);
+        logWithTimestamp(`Áudio convertido para MP3: ${mp3Path}`);
 
-        // Envia o arquivo MP3
         const media = MessageMedia.fromFilePath(mp3Path);
         await client.sendMessage(chatId, media, { caption: `🎵 ${video.title}` });
+        logWithTimestamp(`Áudio enviado para ${chatId}`);
+
         await client.sendMessage(chatId, "Deseja fazer outra busca? Envie *start* para começar.");
-        logWithTimestamp(`Música enviada: ${video.title}`);
-    } catch (err) {
-        logWithTimestamp(`Erro ao baixar/converter/enviar música: ${err}`);
-        await client.sendMessage(chatId, "Erro ao baixar ou converter a música.");
+    } catch (error) {
+        logWithTimestamp(`Erro no download/conversão: ${error}`);
+        await client.sendMessage(chatId, "⚠️ Ocorreu um erro ao processar o áudio.");
     } finally {
-        // Limpa arquivos temporários
-        [mp3Path, tempAudioPath].forEach((file) => {
-            if (fs.existsSync(file)) {
-                fs.unlinkSync(file);
-                logWithTimestamp(`Arquivo removido: ${file}`);
-            }
-        });
-        state.step = "init";
-        state.youtubeResults = undefined;
+        clearTempFiles(mp3Path, tempAudioPath);
     }
+
+    state.step = "init";
+    state.youtubeResults = undefined;
 }
 
 // Lida com reconhecimento de áudio enviado pelo usuário
@@ -180,7 +109,7 @@ async function handleAudioRecognition(client, chatId, message, state) {
 
             const track = result.track;
             if (track) {
-                const response = `🎵 Música reconhecida!\n👉 ${track.title} - ${track.subtitle}`;
+                const response = `🎵 Música reconhecida!\\n👉 ${track.title} - ${track.subtitle}`;
                 const covertArt = track.images ? track.images.coverart : null;
 
                 if (covertArt) {
@@ -213,6 +142,7 @@ async function handleAudioRecognition(client, chatId, message, state) {
     }
 }
 
+// Handler principal de mensagens
 client.on("message", async (message) => {
     const chat = await message.getChat();
     const chatId = chat.id._serialized;
@@ -234,7 +164,7 @@ client.on("message", async (message) => {
 
     const state = userStates[chatId];
 
-    // NOVO: Se o usuário enviar "cancelar", reinicia o fluxo
+    // Se o usuário enviar "cancelar", reinicia o fluxo
     if (textMessage.toLowerCase() === "cancelar") {
         state.step = "init";
         state.youtubeResults = undefined;
@@ -251,7 +181,7 @@ client.on("message", async (message) => {
     // Lógica principal
     if (state.step === "init") {
         if (textMessage.toLowerCase() === "start") {
-            logWithTimestamp(`Usuário ${chatId} iniciou o reconhecimento.`);
+            logWithTimestamp(`Usuário ${chatId} iniciou o bot.`);
             await client.sendMessage(
                 chatId,
                 `Olá, Como deseja encontrar a sua música?\n1 - Gravar um áudio com a música que deseja reconhecer.\n2 - Informar título e artista\n\n*Você pode digitar "cancelar" a qualquer momento para reiniciar o processo.*`
@@ -325,4 +255,5 @@ client.on("message", async (message) => {
     state.step = "init";
 });
 
+// Inicializa o cliente WhatsApp
 client.initialize();
