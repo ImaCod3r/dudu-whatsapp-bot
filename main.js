@@ -34,8 +34,18 @@ client.on("ready", () => {
   logWithTimestamp("✅ WhatsApp Bot pronto!");
 });
 
+client.on("disconnected", (reason) => {
+  logWithTimestamp(`❌ Cliente desconectado! Motivo: ${reason}`);
+  logWithTimestamp("Tentando reconectar...");
+  client.initialize();
+});
+
 // Handler principal de mensagens
-client.on("message", async (message) => {
+client.on("message_create", async (message) => {
+  // Ignora mensagens enviadas pelo próprio bot (para não criar um loop infinito dele conversando sozinho)
+  if (message.fromMe && !message.to.includes(message.from)) {
+    return;
+  }
   await messageHandler(client, message);
 });
 
