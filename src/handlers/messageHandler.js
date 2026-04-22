@@ -43,10 +43,11 @@ export async function messageHandler(client, message) {
   // Lógica principal
   if (state.step === "init") {
     if (textMessage.toLowerCase() === "start") {
-      logWithTimestamp(`Usuário ${chatId} iniciou o bot.`);
+      const userName = getUserName(chat);
+      logWithTimestamp(`Usuário ${userName} (${chatId}) iniciou o bot.`);
       await client.sendMessage(
         chatId,
-        `Olá, Como deseja encontrar a sua música?\n1 - Gravar um áudio com a música que deseja reconhecer.\n2 - Informar título e artista\n\n*Você pode digitar "cancelar" a qualquer momento para reiniciar o processo.*`,
+        `Olá, ${userName}! Como deseja encontrar a sua música?\n1 - Gravar um áudio com a música que deseja reconhecer.\n2 - Informar título e artista\n\n*Você pode digitar "cancelar" a qualquer momento para reiniciar o processo.*`,
       );
       stateManager.update(chatId, { step: "awaiting_option" });
     } else {
